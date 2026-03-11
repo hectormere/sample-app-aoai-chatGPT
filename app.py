@@ -36,6 +36,17 @@ from backend.utils import (
     format_pf_non_streaming_response,
 )
 
+# --- Seguridad para Teams Tabs ---
+FRAME_ANCESTORS = (
+    "frame-ancestors "
+    "https://teams.microsoft.com "
+    "https://*.teams.microsoft.com "
+    "https://*.cloud.microsoft;"
+)
+X_FRAME_OPTIONS = "ALLOW-FROM https://teams.microsoft.com/"
+# ---------------------------------
+
+
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
 cosmos_db_ready = asyncio.Event()
@@ -46,6 +57,18 @@ def create_app():
     app.register_blueprint(bp)
     app.config["TEMPLATES_AUTO_RELOAD"] = True
     
+    # >>> Cabeceras requeridas por Microsoft Teams para iframes <<<
+    @app.after_request
+    async def add_security_headers(response):
+        # CSP imprescindible para que Teams pueda embeber la web
+        # Documentación: requisitos de Tabs y CSP frame-ancestors
+        # https://learn.microsoft.com/.../tab-requirements
+        response.headers["Content-Security-Policy"] = FRAME_ANCESTORS
+        # X-Frame-Options en desuso pero aún útil en algunos navegadores
+        response.headers["X-Frame-Options"] = X_FRAME_OPTIONS
+        return response
+    # <<< Fin cabeceras >>>
+
     @app.before_serving
     async def init():
         try:
