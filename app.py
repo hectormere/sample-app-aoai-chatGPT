@@ -1,69 +1,82 @@
 # app.py
-import os
-import io
+# NOTE: This file preserves the original Quart UI behavior (static/index.html)
+# and ONLY changes the conversation backend to use an Azure AI Foundry Agent by ID.
+
+import copy
 import json
-import asyncio
-import base64
+import os
 import logging
-import getpass
-from typing import Dict, List
+import uuid
+import httpx
+import asyncio
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from quart import (
+    Blueprint,
+    Quart,
+    jsonify,
+    make_response,
+    request,
+    send_from_directory,
+    render_template,
+    current_app,
+)
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
+from openai import AsyncAzureOpenAI
 
-from PIL import Image
+from azure.identity.aio import (
+    DefaultAzureCredential as AioDefaultAzureCredential,
+    get_bearer_token_provider
+)
 
 from azure.identity import DefaultAzureCredential
 from azure.ai.projects import AIProjectClient
-from azure.ai.agents.models import (
-    MessageInputTextBlock,
-    MessageInputImageUrlBlock,
-    MessageImageUrlParam,
+from azure.ai.agents.models import MessageInputTextBlock
+
+from backend.auth.auth_utils import get_authenticated_user_details
+from backend.security.ms_defender_utils import get_msdefender_user_json
+from backend.history.cosmosdbservice import CosmosConversationClient
+from backend.settings import (
+    app_settings,
+    MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION
+)
+from backend.utils import (
+    format_as_ndjson,
+    format_stream_response,
+    format_non_streaming_response,
+    convert_to_pf_format,
+    format_pf_non_streaming_response,
 )
 
-# -----------------------------
-# Configuración y logging
-# -----------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("app")
+FRAME_ANCESTORS = (
+    "frame-ancestors "
+    "https://teams.microsoft.com "
+    "https://*.teams.microsoft.com "
+    "https://*.cloud.microsoft;"
+)
+X_FRAME_OPTIONS = "ALLOW-FROM https://teams.microsoft.com/"
 
-RETRIEVAL_EXTS = {
-    ".c", ".cpp", ".cs", ".css", ".doc", ".docx", ".go", ".html", ".java", ".js",
-    ".json", ".md", ".pdf", ".php", ".pptx", ".py", ".rb", ".sh", ".tex", ".ts", ".txt"
-}
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
+cosmos_db_ready = asyncio.Event()
 
-# Variables de entorno requeridas
 CONN_STR = os.getenv("CONN_STR")
 AGENT_ID = os.getenv("AZURE_AGENT_ID") or os.getenv("AZURE_VOICELIVE_AGENT_ID")
 
 if not CONN_STR:
-    raise RuntimeError("Falta CONN_STR (cadena de conexión del AI Project).")
+    raise RuntimeError("Falta CONN_STR en variables de entorno.")
 if not AGENT_ID:
-    raise RuntimeError("Falta AZURE_AGENT_ID (o AZURE_VOICELIVE_AGENT_ID).")
+    raise RuntimeError("Falta AZURE_AGENT_ID (o AZURE_VOICELIVE_AGENT_ID) en variables de entorno.")
 
-# Cliente Foundry (SDK síncrono)
-_credential = DefaultAzureCredential(exclude_visual_studio_code_credential=True)
-_project_client = AIProjectClient.from_connection_string(credential=_credential, conn_str=CONN_STR)
-_agent = _project_client.agents.get_agent(AGENT_ID)
+_foundry_cred = DefaultAzureCredential(exclude_visual_studio_code_credential=True)
+_project_client = AIProjectClient.from_connection_string(credential=_foundry_cred, conn_str=CONN_STR)
+_threads = {}
 
-# Estado en memoria por conversación
-_threads: Dict[str, str] = {}                 # conversation_id -> thread_id
-_pending_images: Dict[str, List[dict]] = {}   # conversation_id -> [{"data_url": "...", "bytes": N, "mime": "..."}]
-_uploaded_files: Dict[str, List[dict]] = {}   # opcional: solo meta de lo subido
 
-# -----------------------------
-# Utilidades
-# -----------------------------
 def _ensure_thread(conversation_id: str) -> str:
     if conversation_id not in _threads:
         th = _project_client.agents.create_thread()
         _threads[conversation_id] = th.id
     return _threads[conversation_id]
+
 
 def _best_ts(m: dict):
     v = m.get("created_at")
@@ -74,8 +87,8 @@ def _best_ts(m: dict):
         return v
     return -1
 
+
 def _extract_last_assistant_text(list_messages_result) -> str:
-    """Extrae texto del último mensaje del asistente desde list_messages()."""
     try:
         md = list_messages_result.as_dict()
     except Exception:
@@ -97,149 +110,195 @@ def _extract_last_assistant_text(list_messages_result) -> str:
                     if txt:
                         texts.append(txt)
             if texts:
-                return "\n".join(texts)
+                return "".join(texts)
         t = chosen.get("text")
         if isinstance(t, dict) and t.get("value"):
             return t["value"]
     return ""
 
-def _image_to_data_url(raw: bytes) -> dict:
-    """Convierte imagen a JPEG comprimido y devuelve data_url + meta."""
-    try:
-        im = Image.open(io.BytesIO(raw))
-    except Exception:
-        b64 = base64.b64encode(raw).decode("utf-8")
-        return {"mime": "application/octet-stream",
-                "data_url": f"data:application/octet-stream;base64,{b64}",
-                "bytes": len(raw)}
-    max_w = 1024
-    if im.width > max_w:
-        new_h = int(im.height * (max_w / im.width))
-        im = im.resize((max_w, new_h))
-    if im.mode not in ("RGB", "L"):
-        im = im.convert("RGB")
-    out = io.BytesIO()
-    im.save(out, format="JPEG", quality=75)
-    data = out.getvalue()
-    b64 = base64.b64encode(data).decode("utf-8")
-    return {"mime": "image/jpeg",
-            "data_url": f"data:image/jpeg;base64,{b64}",
-            "bytes": len(data)}
 
 def _run_agent_sync(conversation_id: str, user_text: str) -> str:
-    """Ejecución síncrona del agente; se invoca desde un hilo con asyncio.to_thread."""
     thread_id = _ensure_thread(conversation_id)
-    blocks = [MessageInputTextBlock(text=user_text or "")]
-    for img in _pending_images.get(conversation_id, []):
-        blocks.append(MessageInputImageUrlBlock(image_url=MessageImageUrlParam(url=img["data_url"])))
-    _pending_images[conversation_id] = []
-
-    # Crea mensaje y run
-    content_to_send = blocks if len(blocks) > 1 else user_text
-    _project_client.agents.create_message(thread_id=thread_id, role="user", content=content_to_send)
-    _project_client.agents.create_and_process_run(thread_id=thread_id, agent_id=_agent.id)
+    agent = _project_client.agents.get_agent(AGENT_ID)
+    try:
+        content = [MessageInputTextBlock(text=user_text or "")]
+    except Exception:
+        content = user_text or ""
+    _project_client.agents.create_message(thread_id=thread_id, role="user", content=content)
+    _project_client.agents.create_and_process_run(thread_id=thread_id, agent_id=agent.id)
     msgs = _project_client.agents.list_messages(thread_id=thread_id)
     return _extract_last_assistant_text(msgs)
 
-# -----------------------------
-# FastAPI app
-# -----------------------------
-app = FastAPI()
 
-# Static
-if os.path.isdir("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
-if os.path.isdir("public"):
-    app.mount("/public", StaticFiles(directory="public"), name="public")
+def create_app():
+    app = Quart(__name__)
+    app.register_blueprint(bp)
+    app.config["TEMPLATES_AUTO_RELOAD"] = True
 
-# CSP para que Teams pueda embeber (iframe)
-class TeamsIframeMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response: Response = await call_next(request)
-        response.headers["Content-Security-Policy"] = (
-            "frame-ancestors https://teams.microsoft.com https://*.teams.microsoft.com https://*.office.com;"
-        )
-        response.headers["X-Frame-Options"] = "ALLOW-FROM https://teams.microsoft.com/"
+    @app.after_request
+    async def add_security_headers(response):
+        response.headers["Content-Security-Policy"] = FRAME_ANCESTORS
+        response.headers["X-Frame-Options"] = X_FRAME_OPTIONS
         return response
 
-app.add_middleware(TeamsIframeMiddleware)
+    @app.before_serving
+    async def init():
+        try:
+            app.cosmos_conversation_client = await init_cosmosdb_client()
+            cosmos_db_ready.set()
+        except Exception as e:
+            logging.exception("Failed to initialize CosmosDB client")
+            app.cosmos_conversation_client = None
+            raise e
 
-# -----------------------------
-# Rutas
-# -----------------------------
-@app.get("/", response_class=HTMLResponse)
-def index():
-    # Sirve index.html de la raíz si existe; si no, un HTML mínimo
-    if os.path.isfile("index.html"):
-        return FileResponse("index.html", media_type="text/html")
-    html = """<!doctype html>
-<html lang="es"><head><meta charset="utf-8"/><title>Agente</title></head>
-<body><h1>Agente de Soporte</h1><p>Sube index.html a la raíz para tu UI.</p></body></html>"""
-    return HTMLResponse(html)
+    return app
 
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok", "agent_id": AGENT_ID}
 
-@app.get("/tools/userinfo")
-def tool_userinfo():
-    # En App Service no hay 'az' CLI; devolvemos info básica
-    upn = os.getenv("WEBSITE_OWNER_NAME")  # best-effort
-    return {"display_name": getpass.getuser(), "upn": upn, "mail": upn}
+@bp.route("/")
+async def index():
+    return await render_template(
+        "index.html",
+        title=app_settings.ui.title,
+        favicon=app_settings.ui.favicon
+    )
 
-@app.post("/api/upload")
-async def upload_files(conversation_id: str = Form(...), files: List[UploadFile] = File(...)):
-    if not files:
-        raise HTTPException(status_code=400, detail="No se recibieron ficheros")
-    uploaded, skipped_for_retrieval, accepted_images = [], [], []
-    try:
-        for up in files:
-            suffix = os.path.splitext(up.filename)[-1].lower() or ""
-            raw = await up.read()
-            meta = {
-                "filename": up.filename,
-                "ext": suffix,
-                "size_bytes": len(raw),
-                "retrieval_supported": suffix in RETRIEVAL_EXTS,
-                "is_image": suffix in IMAGE_EXTS,
-            }
-            uploaded.append(meta)
-            if suffix in IMAGE_EXTS:
-                data = _image_to_data_url(raw)
-                item = {
-                    "filename": up.filename,
-                    "mime": data["mime"],
-                    "bytes": data["bytes"],
-                    "data_url": data["data_url"],
-                }
-                _pending_images.setdefault(conversation_id, []).append(item)
-                accepted_images.append({"filename": up.filename, "mime": data["mime"], "bytes": data["bytes"]})
-            if suffix not in RETRIEVAL_EXTS:
-                skipped_for_retrieval.append(meta)
-        _uploaded_files.setdefault(conversation_id, []).extend(uploaded)
-        return {
-            "uploaded": uploaded,
-            "accepted_images": accepted_images,
-            "skipped_for_retrieval": skipped_for_retrieval,
-        }
-    except Exception as e:
-        logger.exception("Error subiendo ficheros")
-        raise HTTPException(status_code=500, detail=f"Error subiendo ficheros: {e}")
 
-@app.get("/api/chat/stream")
-async def chat_stream(conversation_id: str, message: str):
-    # Ejecuta el agente y “streamea” el texto troceado para tu UI
-    try:
-        text = await asyncio.to_thread(_run_agent_sync, conversation_id, message)
-    except Exception as e:
-        logger.exception("Error ejecutando el agente")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+@bp.route("/favicon.ico")
+async def favicon():
+    return await bp.send_static_file("favicon.ico")
 
-    async def event_gen():
-        # troceo simple por espacios para simular SSE incremental
-        for token in (text or "").split(" "):
-            yield f"data: {token} \n\n"
+
+@bp.route("/assets/<path:path>")
+async def assets(path):
+    return await send_from_directory("static/assets", path)
+
+
+DEBUG = os.environ.get("DEBUG", "false")
+if DEBUG.lower() == "true":
+    logging.basicConfig(level=logging.DEBUG)
+
+
+async def init_cosmosdb_client():
+    cosmos_conversation_client = None
+    if app_settings.chat_history:
+        cosmos_endpoint = f"https://{app_settings.chat_history.account}.documents.azure.com:443/"
+        if not app_settings.chat_history.account_key:
+            async with AioDefaultAzureCredential() as cred:
+                credential = cred
+        else:
+            credential = app_settings.chat_history.account_key
+
+        cosmos_conversation_client = CosmosConversationClient(
+            cosmosdb_endpoint=cosmos_endpoint,
+            credential=credential,
+            database_name=app_settings.chat_history.database,
+            container_name=app_settings.chat_history.conversations_container,
+            enable_message_feedback=app_settings.chat_history.enable_feedback,
+        )
+    return cosmos_conversation_client
+
+
+class _FakeDelta:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _FakeChoiceDelta:
+    def __init__(self, content: str):
+        self.delta = _FakeDelta(content)
+
+
+class _FakeChunk:
+    def __init__(self, content: str):
+        self.choices = [_FakeChoiceDelta(content)]
+
+
+class _FakeMessage:
+    def __init__(self, content: str):
+        self.content = content
+        self.role = "assistant"
+
+
+class _FakeChoice:
+    def __init__(self, content: str):
+        self.message = _FakeMessage(content)
+
+
+class _FakeResponse:
+    def __init__(self, content: str):
+        self.choices = [_FakeChoice(content)]
+
+
+def _extract_last_user_text(request_body: dict) -> str:
+    msgs = request_body.get("messages", [])
+    for m in reversed(msgs):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return m.get("content") or ""
+    return ""
+
+
+def _get_conversation_id(request_body: dict) -> str:
+    hm = request_body.get("history_metadata") or {}
+    if isinstance(hm, dict) and hm.get("conversation_id"):
+        return hm.get("conversation_id")
+    if request_body.get("conversation_id"):
+        return request_body.get("conversation_id")
+    return str(uuid.uuid4())
+
+
+async def send_chat_request(request_body, request_headers):
+    conversation_id = _get_conversation_id(request_body)
+    user_text = _extract_last_user_text(request_body)
+    answer = await asyncio.to_thread(_run_agent_sync, conversation_id, user_text)
+    return _FakeResponse(answer), None
+
+
+async def complete_chat_request(request_body, request_headers):
+    response, _ = await send_chat_request(request_body, request_headers)
+    history_metadata = request_body.get("history_metadata", {}) or {}
+    if isinstance(history_metadata, dict) and "conversation_id" not in history_metadata:
+        history_metadata["conversation_id"] = _get_conversation_id(request_body)
+    return format_non_streaming_response(response, history_metadata, apim_request_id=None)
+
+
+async def stream_chat_request(request_body, request_headers):
+    response, _ = await send_chat_request(request_body, request_headers)
+    history_metadata = request_body.get("history_metadata", {}) or {}
+    if isinstance(history_metadata, dict) and "conversation_id" not in history_metadata:
+        history_metadata["conversation_id"] = _get_conversation_id(request_body)
+
+    full_text = response.choices[0].message.content or ""
+
+    async def generate(apim_request_id, history_metadata):
+        for token in full_text.split(" "):
+            yield format_stream_response(_FakeChunk(token + " "), history_metadata, apim_request_id=None)
             await asyncio.sleep(0.01)
-        yield "data: [DONE]\n\n"
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    return generate(apim_request_id=None, history_metadata=history_metadata)
+
+
+async def conversation_internal(request_body, request_headers):
+    try:
+        if app_settings.azure_openai.stream and not app_settings.base_settings.use_promptflow:
+            result = await stream_chat_request(request_body, request_headers)
+            response = await make_response(format_as_ndjson(result))
+            response.timeout = None
+            response.mimetype = "application/json-lines"
+            return response
+        else:
+            result = await complete_chat_request(request_body, request_headers)
+            return jsonify(result)
+    except Exception as ex:
+        logging.exception(ex)
+        return jsonify({"error": str(ex)}), 500
+
+
+@bp.route("/conversation", methods=["POST"])
+async def conversation():
+    if not request.is_json:
+        return jsonify({"error": "request must be json"}), 415
+    request_json = await request.get_json()
+    return await conversation_internal(request_json, request.headers)
+
+
+app = create_app()
