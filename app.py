@@ -55,8 +55,8 @@ if not AGENT_ID:
     raise RuntimeError("Falta AZURE_AGENT_ID (o AZURE_VOICELIVE_AGENT_ID) en variables de entorno.")
 
 _foundry_cred = DefaultAzureCredential(exclude_visual_studio_code_credential=True)
-#_project_client = AIProjectClient.from_connection_string(credential=_foundry_cred, conn_str=CONN_STR)
-_project_client = AIProjectClient(endpoint=os.getenv("AZURE_AI_PROJECT_ENDPOINT"),credential=_foundry_cred)
+_project_client = AIProjectClient.from_connection_string(credential=_foundry_cred, conn_str=CONN_STR)
+#_project_client = AIProjectClient(endpoint=os.getenv("AZURE_AI_PROJECT_ENDPOINT"),credential=_foundry_cred)
 _openai_client = _project_client.get_openai_client()
 
 _threads = {}  # conversation_id -> thread_id
