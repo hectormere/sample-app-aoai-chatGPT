@@ -1,0 +1,37 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "11e543bf-bac9-481c-9823-fc8fde99216c",
+  "packageName": "com.barcelo.soporte.test",
+  "developer": {
+    "name": "Barceló Hotel Group",
+    "websiteUrl": "https://soporteit-tfmii.azurewebsites.net",
+    "privacyUrl": "https://soporteit-tfmii.azurewebsites.net/privacy",
+    "termsOfUseUrl": "https://soporteit-tfmii.azurewebsites.net/terms"
+  },
+  "name": {
+    "short": "BDC Soporte IT TFM II (test)",
+    "full": "Barceló Soporte IT TFM II (test)"
+  },
+  "description": {
+    "short": "Versión de prueba de Barceló Soporte IT TFM II",
+    "full": "Aplicación Web integrada en Teams para pruebas del Soporte IT TFM II de Barceló"
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#FFFFFF",
+  "staticTabs": [
+    {
+      "entityId": "soporteit-tfmiiTab",
+      "name": "Soporte IT TFMII",
+      "contentUrl": "https://soporteit-tfmii.azurewebsites.net",
+      "websiteUrl": "https://soporteit-tfmii.azurewebsites.net",
+      "scopes": ["personal"]
+    }
+  ],
+  "permissions": ["identity"],
+  "validDomains": ["soporteit-tfmii.azurewebsites.net"]
+}

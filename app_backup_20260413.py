@@ -55,10 +55,7 @@ if not AGENT_ID:
     raise RuntimeError("Falta AZURE_AGENT_ID (o AZURE_VOICELIVE_AGENT_ID) en variables de entorno.")
 
 _foundry_cred = DefaultAzureCredential(exclude_visual_studio_code_credential=True)
-#_project_client = AIProjectClient.from_connection_string(credential=_foundry_cred, conn_str=CONN_STR)
-_project_client = AIProjectClient(endpoint=os.getenv("AZURE_AI_PROJECT_ENDPOINT"),credential=_foundry_cred)
-_openai_client = _project_client.get_openai_client()
-
+_project_client = AIProjectClient.from_connection_string(credential=_foundry_cred, conn_str=CONN_STR)
 _threads = {}  # conversation_id -> thread_id
 
 
@@ -109,49 +106,13 @@ def _extract_last_assistant_text(list_messages_result) -> str:
 
 
 def _run_agent_sync(conversation_id: str, user_text: str) -> str:
-    #thread_id = _ensure_thread(conversation_id)
-    #agent = _project_client.agents.get_agent(AGENT_ID)
-    #content = [MessageInputTextBlock(text=user_text or "")]
-    #_project_client.agents.create_message(thread_id=thread_id, role="user", content=content)
-    #_project_client.agents.create_and_process_run(thread_id=thread_id, agent_id=agent.id)
-    #msgs = _project_client.agents.list_messages(thread_id=thread_id)
-    #return _extract_last_assistant_text(msgs)
-
-    resp = _openai_client.responses.create(
-        input=[
-            {
-                "role": "user",
-                "content": user_text or ""
-            }
-        ],
-        extra_body={
-            "agent_reference": {
-                "name": os.getenv("AZURE_FOUNDRY_AGENT_NAME"),
-                "version": os.getenv("AZURE_FOUNDRY_AGENT_VERSION"),
-                "type": "agent_reference"
-            }
-        }
-    )
-
-    # extracción robusta del texto
-    try:
-        if getattr(resp, "output_text", None):
-            return resp.output_text
-    except Exception:
-        pass
-
-    try:
-        out = resp.to_dict().get("output", [])
-        for item in out:
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        return c.get("text", "")
-    except Exception:
-        pass
-
-    return ""
-
+    thread_id = _ensure_thread(conversation_id)
+    agent = _project_client.agents.get_agent(AGENT_ID)
+    content = [MessageInputTextBlock(text=user_text or "")]
+    _project_client.agents.create_message(thread_id=thread_id, role="user", content=content)
+    _project_client.agents.create_and_process_run(thread_id=thread_id, agent_id=agent.id)
+    msgs = _project_client.agents.list_messages(thread_id=thread_id)
+    return _extract_last_assistant_text(msgs)
 
 
 def create_app():
