@@ -79,7 +79,7 @@ _threads = {}  # conversation_id -> thread_id
 
 def _ensure_thread(conversation_id: str) -> str:
     if conversation_id not in _threads:
-        th = _project_client.agents.create_thread()
+        th = _project_client.agents.threads.create()
         _threads[conversation_id] = th.id
     return _threads[conversation_id]
 
@@ -147,9 +147,22 @@ def _run_agent_sync(conversation_id: str, user_text: str) -> str:
     agent_id = _get_agent_id_by_name_version(AGENT_NAME, AGENT_VERSION)
     #agent = _project_client.agents.get_agent(AGENT_ID)
     content = [MessageInputTextBlock(text=user_text or "")]
-    _project_client.agents.create_message(thread_id=thread_id, role="user", content=content)
-    _project_client.agents.create_and_process_run(thread_id=thread_id, agent_id=agent_id)
-    msgs = _project_client.agents.list_messages(thread_id=thread_id)
+    #_project_client.agents.create_message(thread_id=thread_id, role="user", content=content)
+    #_project_client.agents.create_and_process_run(thread_id=thread_id, agent_id=agent_id)
+    #msgs = _project_client.agents.list_messages(thread_id=thread_id)
+    #return _extract_last_assistant_text(msgs)
+    _project_client.agents.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=content,
+    )
+
+    _project_client.agents.runs.create_and_process(
+        thread_id=thread_id,
+        agent_id=agent_id,
+    )
+
+    msgs = _project_client.agents.messages.list(thread_id=thread_id)
     return _extract_last_assistant_text(msgs)
 
 
